@@ -104,7 +104,8 @@ class _WrappedDatasetProvider:
 class GraphTensorPadding(Protocol):
   """Collects `GraphtTensor` padding helpers."""
 
-  def get_filter_fn(self, target_batch_size: int) -> Callable[..., bool]:
+  def get_filter_fn(self,
+                    size_constraints: SizeConstraints) -> Callable[..., bool]:
     """"""
     raise NotImplementedError()
 
@@ -278,6 +279,14 @@ def make_preprocessing_model(
   return tf.keras.Model(gt, (x, y, mask))
 
 
+def _get_padding_constraints_and_filter_fn(
+    padding: GraphTensorPadding,
+    batch_size: int) -> Tuple[tfgnn.SizeConstraints, Callable[..., bool]]:
+  size_constraints = padding.get_size_constraints(batch_size)
+  filter_fn = padding.get_filter_fn(size_constraints)
+  return size_constraints, filter_fn
+
+
 def run(*,
         train_ds_provider: DatasetProvider,
         model_fn: Callable[[tfgnn.GraphTensorSpec], tf.keras.Model],
@@ -351,17 +360,16 @@ def run(*,
   parsing_model = make_parsing_model(gtspec)
   preprocess_model = make_preprocessing_model(gtspec, feature_processors or ())
 
-  def apply_fn(ds, *, padding: Optional[GraphTensorPadding] = None):
+  def apply_fn(ds,
+               *,
+               padding_size_constraints: Optional[SizeConstraints] = None,
+               padding_filter_fn: Optional[Callable[..., bool]] = None):
     ds = _map_over_dataset(ds, parsing_model)
-    if padding is not None:
-      target_batch_size = _per_replica_batch_size(
-          global_batch_size,
-          trainer.strategy.num_replicas_in_sync)
+    if padding_size_constraints is not None and padding_filter_fn is not None:
       padding_preprocess_model = make_preprocessing_model(
-          gtspec,
-          feature_processors or (),
-          padding.get_size_constraints(target_batch_size))
-      ds = ds.filter(padding.get_filter_fn(target_batch_size))
+          gtspec, feature_processors or (),
+          padding_size_constraints)
+      ds = ds.filter(padding_filter_fn)
       ds = _map_over_dataset(ds, padding_preprocess_model)
     else:
       ds = _map_over_dataset(ds, preprocess_model)
@@ -369,13 +377,27 @@ def run(*,
     # in the `map_fn.`
     return functools.reduce(lambda acc, fn: fn(acc), task.preprocessors(), ds)
 
+  target_batch_size = _per_replica_batch_size(
+      global_batch_size, trainer.strategy.num_replicas_in_sync)
   if train_padding is not None:
-    train_apply_fn = functools.partial(apply_fn, padding=train_padding)
+    train_size_constraints, train_filter_fn = (
+        _get_padding_constraints_and_filter_fn(train_padding,
+                                               target_batch_size))
+    train_apply_fn = functools.partial(
+        apply_fn,
+        padding_size_constraints=train_size_constraints,
+        padding_filter_fn=train_filter_fn)
   else:
     train_apply_fn = apply_fn
 
   if validate and valid_padding is not None:
-    valid_apply_fn = functools.partial(apply_fn, padding=valid_padding)
+    valid_size_constraints, valid_filter_fn = (
+        _get_padding_constraints_and_filter_fn(valid_padding,
+                                               target_batch_size))
+    valid_apply_fn = functools.partial(
+        apply_fn,
+        padding_size_constraints=valid_size_constraints,
+        padding_filter_fn=valid_filter_fn)
   elif validate:
     valid_apply_fn = apply_fn
 
