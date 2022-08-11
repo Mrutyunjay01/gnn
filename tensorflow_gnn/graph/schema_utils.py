@@ -1,6 +1,6 @@
 """Misc graph tensor utilities."""
 
-from typing import Any, Iterator, Optional, Text, Tuple, Union
+from typing import Any, Iterator, Mapping, Optional, Text, Tuple, Union
 
 import tensorflow as tf
 from tensorflow_gnn.graph import adjacency
@@ -102,6 +102,64 @@ def create_graph_spec_from_schema_pb(
       context_spec=context_spec,
       node_sets_spec=nodes_spec,
       edge_sets_spec=edges_spec)
+
+
+def create_schema_pb_from_graph_spec(
+    graph_spec: gt.GraphTensorSpec) -> schema_pb2.GraphSchema:
+  """Converts GraphTensorSpec to a graph schema proto message.
+
+  The output schema is created for a single graph component. All component
+  dimensions and batch dimensions are discarded. This makes the output
+  result invariant to any sequence of batch, unbatch, merge_batch_to_components
+  transformations of an underlying graph tensor.
+
+  Args:
+    graph_spec: The graph tensor spec of any rank.
+
+  Returns:
+    An instance of the graph schema proto message.
+
+  Raises:
+    ValueError: if adjacency types is not an instance of `fgnn.Adjacency`.
+  """
+  while graph_spec.rank > 0:
+    graph_spec = graph_spec._unbatch()  # pylint: disable=protected-access
+
+  def _to_feature(spec: gc.FieldSpec) -> schema_pb2.Feature:
+    result = schema_pb2.Feature()
+    result.dtype = spec.dtype.as_datatype_enum
+    feature_shape = spec.shape[1:]
+    if feature_shape.rank > 0:
+      result.shape.CopyFrom(feature_shape.as_proto())
+    return result
+
+  def _add_features_spec(features_spec: gc.FieldsSpec,
+                         target: Mapping[str, schema_pb2.Feature]) -> None:
+    for name, spec in features_spec.items():
+      target[name].MergeFrom(_to_feature(spec))
+
+  result = schema_pb2.GraphSchema()
+
+  _add_features_spec(graph_spec.context_spec.features_spec,
+                     result.context.features)
+
+  for name, node_set_spec in graph_spec.node_sets_spec.items():
+    node_set_schema = result.node_sets[name]
+    _add_features_spec(node_set_spec.features_spec, node_set_schema.features)
+
+  for name, edge_set_spec in graph_spec.edge_sets_spec.items():
+    edge_set_schema = result.edge_sets[name]
+    _add_features_spec(edge_set_spec.features_spec, edge_set_schema.features)
+    adjacency_spec = edge_set_spec.adjacency_spec
+    if not isinstance(adjacency_spec, adjacency.AdjacencySpec):
+      raise ValueError(f'Adjacency type `{adjacency_spec.value_type.__name__}`'
+                       f' of the edge set \'{name}\' is not supported.'
+                       ' Expected an instance of `tfgnn.Adjacency`.')
+
+    edge_set_schema.source = edge_set_spec.adjacency_spec.source_name
+    edge_set_schema.target = edge_set_spec.adjacency_spec.target_name
+
+  return result
 
 
 def _is_ragged_dim(dim) -> bool:
