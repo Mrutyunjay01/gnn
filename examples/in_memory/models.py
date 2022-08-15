@@ -5,9 +5,10 @@ from typing import Optional, Tuple, Callable, Union
 
 import tensorflow as tf
 import tensorflow_gnn as tfgnn
+from tensorflow_gnn.models import gat_v2
 from tensorflow_gnn.models import gcn
 
-MODEL_NAMES = ('GCN', 'Simple', 'JKNet')
+MODEL_NAMES = ('GCN', 'Simple', 'JKNet', 'GATv2')
 
 
 def make_map_node_features_layer(
@@ -82,6 +83,8 @@ def make_model_by_name(
   elif model_name == 'JKNet':
     return True, make_jknet_model(
         num_classes, kernel_regularizer=regularizer, **model_kwargs)
+  elif model_name == 'GATv2':
+    return True, make_gatv2_model(num_classes, **model_kwargs)
   else:
     raise ValueError('Invalid model name ' + model_name)
 
@@ -172,6 +175,76 @@ def make_gcn_model(
           tf.keras.layers.Activation(activation)))
 
   return tf.keras.Sequential(layers)
+
+
+# Add deps for "models" to:
+#        "//third_party/py/tensorflow_gnn/models/gat_v2",
+def _combine_classes_via_sum(num_classes, logits):
+  num_shards = logits.shape[1] // num_classes
+  shards = [logits[:, s*num_classes : (s+1)*num_classes]
+            for s in range(num_shards)]
+  return tf.add_n(shards)
+
+
+class _AddSelfLoops(tf.keras.layers.Layer):
+  """Adds self-loops on graph_tensor."""
+
+  def __init__(self, edge_set_name):
+    super().__init__()
+    self._edge_set_name = edge_set_name
+
+  def call(self, graph_tensor: tfgnn.GraphTensor):
+    return tfgnn.add_self_loops(graph_tensor, self._edge_set_name)
+
+  def get_config(self):
+    config = super().get_config().copy()
+    config['edge_set_name'] = self._edge_set_name
+    return config
+
+
+def make_gatv2_model(
+    num_classes: int, depth: int = 2,
+    num_heads=8, per_head_channels=8,
+    hidden_activation: _OptionalActivation = 'relu',
+    out_activation: _OptionalActivation = None,
+    add_self_loops=True,
+    batchnorm: bool = False, dropout: float = 0.8) -> tf.keras.Sequential:
+  """Makes GATv2 tower interleaving GATv2 conv with batchnorm and dropout."""
+  layers = []
+  if add_self_loops:
+    layers.append(_AddSelfLoops(tfgnn.EDGES))
+
+  for i in range(depth):
+    channels = num_classes if i == depth - 1 else per_head_channels
+    activation = None if i == depth - 1 else hidden_activation
+    if dropout > 0:
+      layers.append(make_map_node_features_layer(
+          tf.keras.layers.Dropout(dropout)))
+
+    layers.append(gat_v2.GATv2HomGraphUpdate(
+        num_heads=num_heads, per_head_channels=channels,
+        receiver_tag=tfgnn.SOURCE, activation=None,
+        name='gatv2_layer_%i' % i))
+
+    if batchnorm:
+      layers.append(make_map_node_features_layer(
+          tf.keras.layers.BatchNormalization(momentum=0.9)))
+
+    if activation is not None:
+      layers.append(make_map_node_features_layer(
+          tf.keras.layers.Activation(activation)))
+
+  # psum then out_activation.
+  layers.append(make_map_node_features_layer(
+      functools.partial(_combine_classes_via_sum, num_classes)))
+
+  if out_activation is not None:
+    layers.append(make_map_node_features_layer(
+        tf.keras.layers.Activation(out_activation)))
+
+  model = tf.keras.Sequential(layers)
+
+  return model
 
 
 def make_jknet_model(
