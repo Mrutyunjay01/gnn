@@ -14,8 +14,8 @@
 # ==============================================================================
 """Wraps OGBN and Planetoid datasets to use within tfgnn in-memory example.
 
-* classes `NodeClassificationOgbDatasetWrapper` and `PlanetoidDatasetWrapper`,
-  respectively, wrap datasets of OGBN and Planetoid. Both classes inherit class
+* classes `OgbnDataset` and `PlanetoidDataset`, respectively, wrap datasets of
+  OGBN and Planetoid. Both classes inherit class
   `NodeClassificationDatasetWrapper`. Therefore, they inherit methods
   `export_to_graph_tensor` and `iterate_once`, respectively, which return
   `GraphTensor` object (that can be fed into TF-GNN model) and return a
@@ -23,11 +23,10 @@
 
 * `create_graph_schema_from_directed` creates `tfgnn.GraphSchema` proto.
 """
-
 import os
 import pickle
 import sys
-from typing import Any, Mapping, List, Union
+from typing import Any, Mapping, List, Union, Tuple, NamedTuple
 import urllib.request
 
 import numpy as np
@@ -51,26 +50,29 @@ class NodeClassificationDatasetWrapper:
   """
 
   def num_classes(self) -> int:
-    """Number of node classes. Entries in `labels` should be `< num_classes`."""
+    """Number of node classes. Max of `labels` should be `< num_classes`."""
     raise NotImplementedError('num_classes')
 
-  def node_features(self) -> np.ndarray:
-    """Returns numpy float32 array of shape (num_nodes, feature_dimension)."""
+  def node_features_dicts(self, add_id=True) -> Mapping[
+      tfgnn.NodeSetName, Mapping[str, np.ndarray]]:
     raise NotImplementedError()
 
-  def node_features_dict(self, add_id=True) -> Mapping[str, np.ndarray]:
+  def node_counts(self) -> Mapping[tfgnn.NodeSetName, int]:
+    """Returns total number of graph nodes per node set."""
     raise NotImplementedError()
 
-  def num_nodes(self) -> int:
-    """Returns total number of graph nodes."""
-    raise NotImplementedError()
+  def edge_lists(self) -> Mapping[Tuple[str, str, str], np.ndarray]:
+    """Returns dict from "edge type tuple" to int array of shape (2, num_edges).
 
-  def edge_list(self) -> np.ndarray:
-    """Returns numpy int array of shape (2, num_edges)."""
+    "edge type tuple" string-tuple: (src_node_set, edge_set, target_node_set).
+    """
     raise NotImplementedError()
 
   def node_split(self) -> Mapping[str, np.ndarray]:
-    """Returns dict with node IDs in {train, validation, test} partitions."""
+    """Returns dict with keys "train", "valid", "test" to node IDs.
+
+    These IDs correspond to self.target_node_set.
+    """
     raise NotImplementedError()
 
   def labels(self) -> np.ndarray:
@@ -82,6 +84,11 @@ class NodeClassificationDatasetWrapper:
 
   def test_labels(self) -> np.ndarray:
     """int numpy array of length num_nodes containing train and test labels."""
+    raise NotImplementedError()
+
+  @property
+  def labeled_nodeset(self) -> str:
+    """Name of node set which `labels` and `node_splits` reference."""
     raise NotImplementedError()
 
   def iterate_once(self, add_self_connections: bool = False,
@@ -119,55 +126,68 @@ class NodeClassificationDatasetWrapper:
     Returns:
       GraphTensor containing the entire graph at-once.
     """
-    edge_list = self.edge_list()
-    num_nodes = self.num_nodes()
-    all_nodes = np.arange(num_nodes, dtype=edge_list.dtype)
-    if make_undirected:
-      edge_list = np.concatenate([edge_list, edge_list[::-1]], axis=0)
-    if add_self_connections:
-      self_connections = np.stack([all_nodes, all_nodes], axis=0)
-      edge_list = np.concatenate([edge_list, self_connections], axis=0)
+    # Prepare node sets, edge sets, context, to construct graph tensor.
+    ## Node sets.
+    node_counts = self.node_counts()
+    node_features_dicts = self.node_features_dicts()
+    # From (node_set -> feat -> np.array) to (node_set -> feat -> tf.Tensor).
+    node_features_dicts = (
+        {node_set: {feat_name: _t(feat)
+                    for feat_name, feat in node_feats.items()}
+         for node_set, node_feats in node_features_dicts.items()})
 
-    # Construct `GraphTensor` with `node_sets`, `edge_sets`, and `context`.
-    node_features_dict = self.node_features_dict()
-    node_features_dict = {k: _t(v) for k, v in node_features_dict.items()}
     if split == 'test' or 'test' in split:
-      node_features_dict['label'] = _t(self.test_labels())
+      node_features_dicts[self.labeled_nodeset]['label'] = _t(
+          self.test_labels())
     else:
-      node_features_dict['label'] = _t(self.labels())
-    node_sets = {
-        # Recall: tfgnn.NODES == 'nodes'
-        tfgnn.NODES: tfgnn.NodeSet.from_fields(
-            sizes=_t([num_nodes]),
-            features=node_features_dict)
-    }
+      node_features_dicts[self.labeled_nodeset]['label'] = _t(self.labels())
 
-    edge_sets = {
-        'edges': tfgnn.EdgeSet.from_fields(
-            sizes=_t([edge_list.shape[1]]),
-            adjacency=tfgnn.Adjacency.from_indices(
-                source=(tfgnn.NODES, _t(edge_list[0])),
-                target=(tfgnn.NODES, _t(edge_list[1]))))
-    }
+    node_sets = {}
+    for node_set_name, node_features_dict in node_features_dicts.items():
+      node_sets[node_set_name] = tfgnn.NodeSet.from_fields(
+          sizes=_t([node_counts[node_set_name]]),
+          features=node_features_dict)
 
-    if not make_undirected:
-      edge_sets['rev_edges'] = tfgnn.EdgeSet.from_fields(
+    ## Edge set.
+    edge_sets = {}
+    for edge_type, edge_list in self.edge_lists().items():
+      (source_node_set_name, edge_set_name, target_node_set_name) = edge_type
+
+      if make_undirected:
+        edge_list = np.concatenate([edge_list, edge_list[::-1]], axis=0)
+      if add_self_connections and source_node_set_name == target_node_set_name:
+        all_nodes = np.arange(node_counts[source_node_set_name],
+                              dtype=edge_list.dtype)
+        self_connections = np.stack([all_nodes, all_nodes], axis=0)
+        edge_list = np.concatenate([edge_list, self_connections], axis=0)
+      edge_sets[edge_set_name] = tfgnn.EdgeSet.from_fields(
           sizes=_t([edge_list.shape[1]]),
           adjacency=tfgnn.Adjacency.from_indices(
-              source=(tfgnn.NODES, _t(edge_list[1])),
-              target=(tfgnn.NODES, _t(edge_list[0]))))
+              source=(source_node_set_name, _t(edge_list[0])),
+              target=(target_node_set_name, _t(edge_list[1]))))
+      if not make_undirected:
+        edge_sets['rev_' + edge_set_name] = tfgnn.EdgeSet.from_fields(
+            sizes=_t([edge_list.shape[1]]),
+            adjacency=tfgnn.Adjacency.from_indices(
+                source=(target_node_set_name, _t(edge_list[1])),
+                target=(source_node_set_name, _t(edge_list[0]))))
 
+    ## Context.
     # Expand seed nodes.
     if not isinstance(split, (tuple, list)):
       splits = [split]
     else:
       splits = split
+    node_split = self.node_split()
     seed_nodes = np.concatenate(
-        [self.node_split()[split].reshape(-1) for split in splits], axis=0)
+        [node_split[split].reshape(-1) for split in splits], axis=0)
 
+    # Construct `GraphTensor` with `node_sets`, `edge_sets`, and `context`.
+    seed_feature_name = 'seed_nodes.' + self.labeled_nodeset
     graph_tensor = tfgnn.GraphTensor.from_pieces(
         node_sets=node_sets, edge_sets=edge_sets,
-        context=tfgnn.Context.from_fields(features={'seed': _t(seed_nodes)}))
+        context=tfgnn.Context.from_fields(
+            features={seed_feature_name: _t(seed_nodes)}))
 
     return graph_tensor
 
@@ -200,29 +220,45 @@ def create_graph_schema_from_directed(
   Returns:
     `tfgnn.GraphSchema` describing the node and edge features of the ogbn graph.
   """
-  # Populate node features.
+  # Populate node features specs.
   schema = tfgnn.GraphSchema()
-  node_features = schema.node_sets[tfgnn.NODES]
+  for node_set_name, node_set in dataset.node_features_dicts().items():
+    node_features = schema.node_sets[node_set_name]
+    for feat_name, feature in node_set.items():
+      node_features.features[feat_name].dtype = (
+          tf.dtypes.as_dtype(feature).as_datatype_enum)
+      for dim in feature.shape[1:]:
+        node_features.features[feat_name].shape.dim.add().size = dim
 
-  for feat_name, graph_feats in dataset.node_features_dict().items():
-    node_features.features[feat_name].dtype = (
-        tf.dtypes.as_dtype(graph_feats).as_datatype_enum)
-    for dim in graph_feats.shape[1:]:
-      node_features.features[feat_name].shape.dim.add().size = dim
+  # Populate edge specs.
+  for edge_type in dataset.edge_lists().keys():
+    src_node_set_name, edge_set_name, dst_node_set_name = edge_type
+    # Populate edges with adjacency and it transpose.
+    schema.edge_sets[edge_set_name].source = src_node_set_name
+    schema.edge_sets[edge_set_name].target = dst_node_set_name
+    if not make_undirected:
+      schema.edge_sets['rev_' + edge_set_name].source = dst_node_set_name
+      schema.edge_sets['rev_' + edge_set_name].target = src_node_set_name
 
-  # Populate edges with adjacency and it transpose.
-  schema.edge_sets['edges'].source = tfgnn.NODES
-  schema.edge_sets['edges'].target = tfgnn.NODES
-  if not make_undirected:
-    schema.edge_sets['rev_edges'].source = tfgnn.NODES
-    schema.edge_sets['rev_edges'].target = tfgnn.NODES
-
-  schema.context.features['seed'].dtype = tf.dtypes.int64.as_datatype_enum
+  schema.context.features['seed_nodes.' + dataset.labeled_nodeset].dtype = (
+      tf.dtypes.int64.as_datatype_enum)
 
   return schema
 
 
-class NodeClassificationOgbDatasetWrapper(NodeClassificationDatasetWrapper):
+class _OgbnGraph(NamedTuple):
+  # Maps "node set name" -> number of nodes.
+  num_nodes_dict: Mapping[str, int]
+
+  # Maps "node set name" to dict of "feature name"->np.array.
+  node_feat_dict: Mapping[str, Mapping[str, np.ndarray]]
+
+  # maps (source node set name, edge set name, target node set name) -> edges,
+  # where edges is np.array of shape (2, num edges).
+  edge_index_dict: Mapping[Tuple[str, str, str], np.ndarray]
+
+
+class OgbnDataset(NodeClassificationDatasetWrapper):
   """Wraps OGBN dataset for in-memory learning."""
 
   def __init__(self, dataset_name, cache_dir=None):
@@ -231,46 +267,120 @@ class NodeClassificationOgbDatasetWrapper(NodeClassificationDatasetWrapper):
           'OGB_CACHE_DIR', os.path.expanduser(os.path.join('~', 'data', 'ogb')))
 
     self.ogb_dataset = get_ogbn_dataset(dataset_name, cache_dir)
-    self._graph, self._node_labels = self.ogb_dataset[0]
-    self._node_split = self.ogb_dataset.get_idx_split()
-    self._node_labels = self._node_labels[:, 0]  # rehape from [N, 1] to [N].
+    self._graph, self._node_labels, self._node_split, self._labeled_nodeset = (
+        OgbnDataset._to_heterogenous(self.ogb_dataset))
 
-    self._train_labels = self._node_labels + 0  # Make a copy.
+    # rehape from [N, 1] to [N].
+    self._node_labels = self._node_labels[:, 0]
+
+    # train labels (test set to -1).
+    self._train_labels = np.copy(self._node_labels)
     self._train_labels[self._node_split['test']] = -1
 
+  @staticmethod
+  def _to_heterogenous(
+      ogb_dataset: ogb.nodeproppred.NodePropPredDataset) -> Tuple[
+          _OgbnGraph,  # graph_dict.
+          np.ndarray,  # node_labels.
+          Mapping[str, np.ndarray],  # idx_split.
+          str]:
+    """Returns heterogeneous dicts from homogenous or heterogeneous dataset.
+
+    Args:
+      ogb_dataset: OGBN dataset. It can be homogeneous (single node set type,
+        single edge set type), or heterogeneous (various node/edge set types),
+        and returns data structure as-if the dataset is heterogeneous (i.e.,
+        names each node/edge set). If input is a homogeneous graph, then the
+        node set will be named "nodes" and the edge set will be named "edges".
+
+    Returns:
+      tuple: `(graph_dict, node_labels, idx_split, labeled_nodeset)`, where:
+        `graph_dict` is instance of _OgbnGraph.
+        `node_labels`: np.array of labels, with .shape[0] equals number of nodes
+          in node set with name `labeled_nodeset`.
+        `idx_split`: dict with keys {"test", "train", "valid"} and values are
+          int np.arrays, which refer to indices of nodes in node set with name
+          `labeled_nodeset`.
+        `labeled_nodeset`: name of node set that the node-classification task is
+          designed over.
+    """
+    graph, node_labels = ogb_dataset[0]
+    if 'edge_index_dict' in graph:  # Graph is already heterogeneous
+      assert 'num_nodes_dict' in graph
+      assert 'node_feat_dict' in graph
+      idx_split = ogb_dataset.get_idx_split()
+      labeled_nodeset = list(node_labels.keys())
+      if len(labeled_nodeset) != 1:
+        raise ValueError('Expecting OGB dataset with *one* node set with '
+                         'labels. Found: ' + ', '.join(labeled_nodeset))
+      labeled_nodeset = labeled_nodeset[0]
+
+      node_labels = node_labels[labeled_nodeset]
+      # Change from {'train': {target_node_set: np.array}, 'test': ...}
+      # to {'train': np.array, 'test': np.array, 'valid': np.array}
+      idx_split = {split_name: split_dict[labeled_nodeset]
+                   for split_name, split_dict in idx_split.items()}
+      # node set name -> feature name -> feature matrix (numNodes x featDim).
+      node_set = {node_set_name: {'feat': feat}
+                  for node_set_name, feat in graph['node_feat_dict'].items()}
+      # Populate remaining features
+      for key, node_set_name_to_feat in graph.items():
+        if key.startswith('node_') and key != 'node_feat_dict':
+          feat_name = key.split('node_', 1)[-1]
+          for node_set_name, feat in node_set_name_to_feat.items():
+            node_set[node_set_name][feat_name] = feat
+      ogbn_graph = _OgbnGraph(
+          num_nodes_dict=graph['num_nodes_dict'],
+          node_feat_dict=node_set,
+          edge_index_dict=graph['edge_index_dict'])
+
+      return ogbn_graph, node_labels, idx_split, labeled_nodeset
+
+    # Homogenous graph. Make heterogeneous.
+    ogbn_graph = _OgbnGraph(
+        edge_index_dict={
+            (tfgnn.NODES, tfgnn.EDGES, tfgnn.NODES): graph['edge_index'],
+        },
+        num_nodes_dict={tfgnn.NODES: graph['num_nodes']},
+        node_feat_dict={tfgnn.NODES: {'feat': graph['node_feat']}},
+    )
+    # Copy other node information.
+    for key, value in graph.items():
+      if key != 'node_feat' and key.startswith('node_'):
+        key = key.split('node_', 1)[-1]
+        ogbn_graph.node_feat_dict[tfgnn.NODES][key] = value
+
+    return ogbn_graph, node_labels, ogb_dataset.get_idx_split(), tfgnn.NODES
+
   def num_classes(self) -> int:
-    """Number of node classes. Entries in `labels` should be `< num_classes`."""
     return self.ogb_dataset.num_classes
 
-  def node_features(self) -> np.ndarray:
-    """Returns numpy float32 array of shape (num_nodes, feature_dimension)."""
-    return self._graph['node_feat']
-
-  def node_features_dict(self, add_id=True) -> Mapping[str, np.ndarray]:
-    features = {key.split('node_', 1)[-1]: feats
-                for key, feats in self._graph.items()
-                if key.startswith('node_')}
+  def node_features_dicts(self, add_id=True) -> Mapping[
+      tfgnn.NodeSetName, Mapping[str, np.ndarray]]:
+    # Deep-copy dict (*but* without copying np.arrays).
+    node_sets = self._graph.node_feat_dict
+    node_sets = {node_set_name: dict(node_set.items())
+                 for node_set_name, node_set in node_sets.items()}
     if add_id:
-      features['#id'] = np.arange(self.num_nodes(), dtype='int32')
-    return features
+      node_counts = self.node_counts()
+      for node_set, feat_dict in node_sets.items():
+        feat_dict['#id'] = np.arange(node_counts[node_set], dtype='int32')
+    return node_sets
 
-  def num_nodes(self) -> int:
-    """Returns total number of graph nodes."""
-    return self._graph['num_nodes']
+  @property
+  def labeled_nodeset(self):
+    return self._labeled_nodeset
 
-  def edge_list(self) -> np.ndarray:
-    """Returns numpy int array of shape (2, num_edges)."""
-    return self._graph['edge_index']
+  def node_counts(self) -> Mapping[tfgnn.NodeSetName, int]:
+    return self._graph.num_nodes_dict
+
+  def edge_lists(self) -> Mapping[Tuple[str, str, str], np.ndarray]:
+    return self._graph.edge_index_dict
 
   def node_split(self) -> Mapping[str, np.ndarray]:
-    """Returns dict with node IDs in {train, validation, test} partitions."""
     return self._node_split
 
   def labels(self) -> np.ndarray:
-    """Returns int numpy array of length num_nodes with training labels.
-
-    For test nodes, the label will be set to -1.
-    """
     return self._train_labels
 
   def test_labels(self) -> np.ndarray:
@@ -293,7 +403,7 @@ def _maybe_download_file(source_url, destination_path, make_dirs=True):
         fout.write(fin.read())
 
 
-class PlanetoidDatasetWrapper(NodeClassificationDatasetWrapper):
+class PlanetoidDataset(NodeClassificationDatasetWrapper):
   """Wraps Planetoid node-classificaiton datasets.
 
   These datasets first appeared in the Planetoid [1] paper and popularized by
@@ -326,10 +436,10 @@ class PlanetoidDatasetWrapper(NodeClassificationDatasetWrapper):
 
     # Load data files.
     edge_lists = pickle.load(open(base_path + '.graph', 'rb'))
-    allx = PlanetoidDatasetWrapper.load_x(base_path + '.allx')
+    allx = PlanetoidDataset.load_x(base_path + '.allx')
     ally = np.load(base_path + '.ally', allow_pickle=True)
 
-    testx = PlanetoidDatasetWrapper.load_x(base_path + '.tx')
+    testx = PlanetoidDataset.load_x(base_path + '.tx')
 
     # Add test
     test_idx = list(
@@ -372,29 +482,23 @@ class PlanetoidDatasetWrapper(NodeClassificationDatasetWrapper):
       return np.load(filename)
 
   def num_classes(self) -> int:
-    """Number of node classes. Entries in `labels` should be `< num_classes`."""
     return self._num_classes
 
-  def node_features(self) -> np.ndarray:
-    """Returns numpy float32 array of shape (num_nodes, feature_dimension)."""
-    return self._allx
-
-  def node_features_dict(self, add_id=True) -> Mapping[str, np.ndarray]:
-    features = {'feat': self.node_features()}
+  def node_features_dicts(self, add_id=True) -> Mapping[
+      tfgnn.NodeSetName, Mapping[str, np.ndarray]]:
+    features = {'feat': self._allx}
     if add_id:
-      features['#id'] = np.arange(self.num_nodes(), dtype='int32')
-    return features
+      features['#id'] = np.arange(self._num_nodes, dtype='int32')
+    return {tfgnn.NODES: features}
 
-  def num_nodes(self) -> int:
-    """Returns total number of graph nodes."""
-    return self._num_nodes
+  def node_counts(self) -> Mapping[tfgnn.NodeSetName, int]:
+    return {tfgnn.NODES: self._num_nodes}
 
-  def edge_list(self) -> np.ndarray:
-    """Returns numpy int array of shape (2, num_edges)."""
-    return self._edge_list
+  def edge_lists(self) -> Mapping[Tuple[str, str, str], np.ndarray]:
+    return {(tfgnn.NODES, tfgnn.EDGES, tfgnn.NODES): self._edge_list}
 
   def node_split(self) -> Mapping[str, np.ndarray]:
-    """Returns dict with node IDs in {train, validation, test} partitions."""
+    """Returns dict with keys "train", "valid", "test" to node IDs."""
     # By default, we mimic Planetoid & GCN setup -- i.e., 20 labels per class.
     labels_per_class = int(os.environ.get('PLANETOID_LABELS_PER_CLASS', '20'))
     num_train_nodes = labels_per_class * self.num_classes()
@@ -404,11 +508,11 @@ class PlanetoidDatasetWrapper(NodeClassificationDatasetWrapper):
         num_train_nodes, num_train_nodes + num_validate_nodes, dtype='int32')
     return {'train': train_ids, 'valid': validate_ids, 'test': self._test_idx}
 
-  def labels(self) -> np.ndarray:
-    """Returns int numpy array of length num_nodes with training labels.
+  @property
+  def labeled_nodeset(self):
+    return tfgnn.NODES
 
-    For test nodes, the label will be set to -1.
-    """
+  def labels(self) -> np.ndarray:
     return self._train_labels
 
   def test_labels(self) -> np.ndarray:
@@ -418,9 +522,9 @@ class PlanetoidDatasetWrapper(NodeClassificationDatasetWrapper):
 
 def get_dataset(dataset_name):
   if dataset_name.startswith('ogbn-'):
-    return NodeClassificationOgbDatasetWrapper(dataset_name)
+    return OgbnDataset(dataset_name)
   elif dataset_name in ('cora', 'citeseer', 'pubmed'):
-    return PlanetoidDatasetWrapper(dataset_name)
+    return PlanetoidDataset(dataset_name)
   else:
     raise ValueError('Unknown Dataset name: ' + dataset_name)
 
